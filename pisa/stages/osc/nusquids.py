@@ -77,10 +77,27 @@ class nusquids(Stage):
         key `prop_height` and take the height from there on a bin-wise or event-wise
         basis depending on `calc_specs`.
     
-    prop_height_min : quantity (distance)
-        Minimum production height (optional). If this value is passed probabilities are
-        averaged between the maximum production height in `prop_height` and this value
-        under the assumption of a uniform production height distribution.
+    prop_height_range : quantity (distance)
+        Production height is averaged around the mean set by `prop_height` assuming
+        a uniform distribution in [mean - range/2, mean + range/2]. The production
+        heights are projected onto the direction of the neutrino, such that the
+        averaging range is longer for shallow angles above the horizon.
+    
+    apply_lowpass_above_hor : bool
+        Whether to apply the low-pass filter for evaluations above the horizon. If
+        `True` (default), the low-pass filter is applied everywhere. If `False`, the 
+        filter is applied only below the horizon. Because propagation distances are
+        very short above the horizon, fast oscillations no longer average out and the
+        filter might wash out important features.
+    
+    apply_height_avg_below_hor : bool
+        Whether to apply the production height averaging below the horizon. If `True`
+        (default), the production height averaging is applied everywhere if a 
+        `prop_height_range` is set. If `False`, the height averaging is only applied
+        above the horizon. Since the production height is only a very small fraction
+        of the total propagation distance below the horizon, the height averaging is
+        no longer important and a little bit of time can be saved by computing the
+        slightly cheaper non-averaged probabilities.
 
     YeI : quantity (dimensionless)
         Inner electron fraction.
@@ -156,7 +173,7 @@ class nusquids(Stage):
         earth_model=None,
         detector_depth=None,
         prop_height=None,
-        prop_height_min=None,
+        prop_height_range=None,
         YeI=None,
         YeO=None,
         YeM=None,
@@ -166,6 +183,8 @@ class nusquids(Stage):
         prop_lowpass_frac=None,
         eval_lowpass_cutoff=None,
         eval_lowpass_frac=None,
+        apply_lowpass_above_hor=True,
+        apply_height_avg_below_hor=True,
         node_mode=None,
         use_decoherence=False,
         num_decoherence_gamma=1,
@@ -196,10 +215,11 @@ class nusquids(Stage):
         self.detector_depth = detector_depth.m_as("km")
         self.prop_height = prop_height.m_as("km")
         self.avg_height = False
-        self.prop_height_min = None
-        if prop_height_min is not None:  # this is optional
-            self.prop_height_min = prop_height_min.m_as("km")
-            self.avg_height = True
+        self.prop_height_range = None
+        self.apply_height_avg_below_hor = apply_height_avg_below_hor
+        if prop_height_range is not None:  # this is optional
+            self.prop_height_range = prop_height_range.m_as("km")
+            self.avg_height = True            
         
         self.layers = None
         
@@ -213,13 +233,15 @@ class nusquids(Stage):
                                     if eval_lowpass_cutoff is not None else 0.)
         self.eval_lowpass_frac = (eval_lowpass_frac.m_as("dimensionless")
                                   if eval_lowpass_frac is not None else 0.)
-        
+
         if self.prop_lowpass_frac > 1. or self.eval_lowpass_frac > 1.:
             raise ValueError("lowpass filter fraction cannot be greater than one")
         
         if self.prop_lowpass_frac < 0. or self.eval_lowpass_frac < 0.:
             raise ValueError("lowpass filter fraction cannot be smaller than zero")
-
+        
+        self.apply_lowpass_above_hor = apply_lowpass_above_hor
+        
         self.nus_layer = None
         self.nus_layerbar = None
         
@@ -428,34 +450,60 @@ class nusquids(Stage):
                                              "nue_nc", "numu_nc", "nutau_nc",
                                              "nuebar_cc", "numubar_cc", "nutaubar_cc",
                                              "nuebar_nc", "numubar_nc", "nutaubar_nc"])
+
         # calculate the distance difference between minimum and maximum production
         # height, if applicable
         if self.avg_height:
-            layers_min = Layers(earth_model, detector_depth, self.prop_height_min)
+            layers_min = Layers(earth_model, detector_depth,
+                                self.prop_height - self.prop_height_range/2.)
             layers_min.setElecFrac(self.YeI, self.YeO, self.YeM)
+            layers_max = Layers(earth_model, detector_depth,
+                                self.prop_height + self.prop_height_range/2.)
+            layers_max.setElecFrac(self.YeI, self.YeO, self.YeM)
         for container in self.data:
             self.layers.calcLayers(container["true_coszen"])
-            distances = self.layers.distance.reshape((container.size, self.layers.max_layers))
+            distances = self.layers.distance.reshape((container.size, -1))
             tot_distances = np.sum(distances, axis=1)
             if self.avg_height:
                 layers_min.calcLayers(container["true_coszen"])
-                dists_min = layers_min.distance.reshape((container.size, self.layers.max_layers))
+                dists_min = layers_min.distance.reshape((container.size, -1))
                 min_tot_dists = np.sum(dists_min, axis=1)
+                
+                layers_max.calcLayers(container["true_coszen"])
+                dists_max = layers_max.distance.reshape((container.size, -1))
+                max_tot_dists = np.sum(dists_max, axis=1)
                 # nuSQuIDS assumes the original distance is the longest distance and 
                 # the averaging range is the difference between the minimum and maximum
                 # distance.
-                avg_ranges = tot_distances - min_tot_dists
+                avg_ranges = max_tot_dists - min_tot_dists
+                tot_distances = max_tot_dists
                 assert np.all(avg_ranges > 0)
+            # If the low-pass cutoff is zero, nusquids will not evaluate the filter.
+            container["lowpass_cutoff"] = (self.eval_lowpass_cutoff
+                                           * np.ones(container.size))
+            if not self.apply_lowpass_above_hor:
+                container["lowpass_cutoff"] = np.where(
+                    container["true_coszen"] >= 0,
+                    0,
+                    container["lowpass_cutoff"]
+                )
             if isinstance(self.node_mode, MultiDimBinning) and not self.exact_mode:
                 # To project out probabilities we only need the *total* distance
                 container["tot_distances"] = tot_distances
-                # for the binned node_mode we already calculated layers above
                 if self.avg_height:
                     container["avg_ranges"] = avg_ranges
+                else:
+                    container["avg_ranges"] = np.zeros(container.size, dtype=FTYPE)
+                if not self.apply_height_avg_below_hor:
+                    container["avg_ranges"] = np.where(
+                        container["true_coszen"] >= 0,
+                        container["avg_ranges"],
+                        0.
+                    )
             elif self.node_mode == "events" or self.exact_mode:
                 # in any other mode (events or exact) we store all densities and 
                 # distances in the container in calc_specs
-                densities = self.layers.density.reshape((container.size, self.layers.max_layers))
+                densities = self.layers.density.reshape((container.size, -1))
                 container["densities"] = densities
                 container["distances"] = distances
         
@@ -536,14 +584,15 @@ class nusquids(Stage):
         return interp_states
 
     def calc_probs_interp(self, flav_out, nubar, interp_states, out_distances,
-                          e_out, avg_ranges=0):
+                          e_out, avg_ranges=0, lowpass_cutoff=0):
         """
         Project out probabilities from interpolated interaction picture states.
         """
         nsq_units = nsq.Const()
 
         prob_interp = np.zeros(e_out.size)
-        scale = self.eval_lowpass_frac * self.eval_lowpass_cutoff / nsq_units.km
+        scale = self.eval_lowpass_frac * lowpass_cutoff
+        
         prob_interp = self.nus_layer.EvalWithState(
             flav_out,
             out_distances,
@@ -551,8 +600,10 @@ class nusquids(Stage):
             interp_states,
             avr_scale=0.,
             rho=int(nubar),
-            lowpass_cutoff=self.eval_lowpass_cutoff / nsq_units.km,
+            lowpass_cutoff=lowpass_cutoff,
             lowpass_scale=scale,
+            # Range averaging is only computed in the places where t_range > 0, so
+            # we don't need to introduce switches for averaged and non-averaged regions.
             t_range=avg_ranges
         )
         return prob_interp
@@ -577,8 +628,7 @@ class nusquids(Stage):
             # electron fraction is already included by multiplying the densities
             # with them in the Layers module, so we pass 1. to nuSQuIDS (unless
             # energies are very high, this should be equivalent).
-            ye = np.broadcast_to(np.array([1.]),
-                                 (container.size, self.layers.max_layers))
+            ye = np.broadcast_to(np.array([1.]), container["densities"].shape)
             nus_layer = nsq.nuSQUIDSLayers(
                 container["distances"] * nsq_units.km,
                 container["densities"],
@@ -664,7 +714,8 @@ class nusquids(Stage):
                     container["interp_states_"+flav_in],
                     container["tot_distances"] * nsq_units.km,
                     container["true_energy"] * nsq_units.GeV,
-                    container["avg_ranges"] * nsq_units.km if self.avg_height else 0.
+                    container["avg_ranges"] * nsq_units.km,
+                    container["lowpass_cutoff"] / nsq_units.km
                 )
             container.mark_changed("prob_e")
             container.mark_changed("prob_mu")
