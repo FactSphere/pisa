@@ -356,7 +356,9 @@ class nusquids(Stage):
         prop_height = self.prop_height
         detector_depth = self.detector_depth
         self.layers = Layers(earth_model, detector_depth, prop_height)
-        self.layers.setElecFrac(self.YeI, self.YeO, self.YeM)
+        # We must treat densities and electron fractions correctly here, so we set them
+        # to 1 in the Layers module to get unweighted densities.
+        self.layers.setElecFrac(1, 1, 1)
         
         nsq_units = nsq.Const()  # natural units for nusquids
         # Because we don't want to extrapolate, we check that all points at which we
@@ -424,10 +426,13 @@ class nusquids(Stage):
                                    (len(e_nodes), self.layers.max_layers))
             densities = np.reshape(self.layers.density,
                                    (len(e_nodes), self.layers.max_layers))
-            # electron fraction is already included by multiplying the densities with
-            # them in the Layers module, so we pass 1. to nuSQuIDS (unless energies are
-            # very high, this should be equivalent).
-            ye = np.broadcast_to(np.array([1.]), (len(e_nodes), self.layers.max_layers))
+            # HACK: We need the correct electron densities for each layer. We can 
+            # determine whether we are in the core or mantle based on the density.
+            # Needless to say it isn't optimal to have these numbers hard-coded.
+            ye = np.zeros_like(densities)
+            ye[densities < 10] = self.YeM
+            ye[(densities >= 10) & (densities < 13)] = self.YeO
+            ye[densities >= 13] = self.YeI
             self.nus_layer = nsq.nuSQUIDSLayers(
                 distances * nsq_units.km,
                 densities,
@@ -456,10 +461,10 @@ class nusquids(Stage):
         if self.avg_height:
             layers_min = Layers(earth_model, detector_depth,
                                 self.prop_height - self.prop_height_range/2.)
-            layers_min.setElecFrac(self.YeI, self.YeO, self.YeM)
+            layers_min.setElecFrac(1, 1, 1)
             layers_max = Layers(earth_model, detector_depth,
                                 self.prop_height + self.prop_height_range/2.)
-            layers_max.setElecFrac(self.YeI, self.YeO, self.YeM)
+            layers_max.setElecFrac(1, 1, 1)
         for container in self.data:
             self.layers.calcLayers(container["true_coszen"])
             distances = self.layers.distance.reshape((container.size, -1))
@@ -625,10 +630,12 @@ class nusquids(Stage):
         for container in self.data:
             nubar = container["nubar"] < 0
             flav = container["flav"]
-            # electron fraction is already included by multiplying the densities
-            # with them in the Layers module, so we pass 1. to nuSQuIDS (unless
-            # energies are very high, this should be equivalent).
-            ye = np.broadcast_to(np.array([1.]), container["densities"].shape)
+            # HACK: We need the correct electron densities for each layer. We can 
+            # determine whether we are in the core or mantle based on the density.
+            ye = np.zeros_like(container["densities"])
+            ye[container["densities"] < 10] = self.YeM
+            ye[(container["densities"] >= 10) & (container["densities"] < 13)] = self.YeO
+            ye[container["densities"] >= 13] = self.YeI
             nus_layer = nsq.nuSQUIDSLayers(
                 container["distances"] * nsq_units.km,
                 container["densities"],
@@ -717,6 +724,7 @@ class nusquids(Stage):
                     container["avg_ranges"] * nsq_units.km,
                     container["lowpass_cutoff"] / nsq_units.km
                 )
+                container["prob_"+flav_in][container["prob_"+flav_in] < 0] = 0.
             container.mark_changed("prob_e")
             container.mark_changed("prob_mu")
         self.data.unlink_containers()
